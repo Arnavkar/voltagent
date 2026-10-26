@@ -11,7 +11,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { safeStringify } from "@voltagent/internal";
-import { generateText } from "ai";
+import { generateText, streamText } from "ai";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 type RecordedRequest = { url: string; headers: Headers };
@@ -59,6 +59,7 @@ describe("model provider registry adapters for bundled cloud providers", () => {
   let metadataHost: string;
   let metadataRequests: string[] = [];
   let requests: RecordedRequest[] = [];
+  let replyOverride: (() => Response) | undefined;
 
   const generateWith = async (modelId: string) => {
     const { ModelProviderRegistry } = await import("./model-provider-registry");
@@ -94,6 +95,7 @@ describe("model provider registry adapters for bundled cloud providers", () => {
 
   beforeEach(() => {
     requests = [];
+    replyOverride = undefined;
     metadataRequests = [];
     (globalThis as Record<string, unknown>).___voltagent_model_provider_registry = undefined;
 
@@ -110,7 +112,7 @@ describe("model provider registry adapters for bundled cloud providers", () => {
     vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = input instanceof Request ? input.url : String(input);
       requests.push({ url, headers: new Headers(init?.headers) });
-      return replyFor(url);
+      return replyOverride ? replyOverride() : replyFor(url);
     });
   });
 
@@ -176,5 +178,83 @@ describe("model provider registry adapters for bundled cloud providers", () => {
 
     expect(request.url).toBe("http://127.0.0.1:11434/api/chat");
     expect(request.headers.get("authorization")).toBeNull();
+  });
+
+  describe("Ollama streaming", () => {
+    const ollamaChunk = (content: string, done: boolean) => ({
+      model: "llama3.2",
+      created_at: "2026-01-01T00:00:00Z",
+      message: { role: "assistant", content },
+      done,
+      ...(done ? { done_reason: "stop", prompt_eval_count: 1, eval_count: 2 } : {}),
+    });
+
+    // Each inner array is one network chunk of NDJSON lines, with a gap between chunks.
+    const streamOllama = async (chunks: unknown[][]) => {
+      replyOverride = () => {
+        const pending = [...chunks];
+        return new Response(
+          new ReadableStream({
+            async pull(controller) {
+              await new Promise((resolve) => setTimeout(resolve, 0));
+              const lines = pending.shift();
+              if (lines === undefined) {
+                controller.close();
+              } else {
+                const text = lines.map((line) => `${safeStringify(line)}\n`).join("");
+                controller.enqueue(new TextEncoder().encode(text));
+              }
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/x-ndjson" } },
+        );
+      };
+      const { ModelProviderRegistry } = await import("./model-provider-registry");
+      const model =
+        await ModelProviderRegistry.getInstance().resolveLanguageModel("ollama/llama3.2");
+      const onError = vi.fn();
+      const result = streamText({ model, prompt: "hi", onError });
+      let text = "";
+      const errors: unknown[] = [];
+      for await (const part of result.fullStream) {
+        if (part.type === "text-delta") {
+          text += part.text;
+        } else if (part.type === "error") {
+          errors.push(part.error);
+        }
+      }
+      return { text, errors, onError, finishReason: await result.finishReason };
+    };
+
+    it("streams text and finishes normally", async () => {
+      const result = await streamOllama([
+        [ollamaChunk("Hello ", false)],
+        [ollamaChunk("world", false)],
+        [ollamaChunk("", true)],
+      ]);
+
+      expect(result.text).toBe("Hello world");
+      expect(result.errors).toEqual([]);
+      expect(result.onError).not.toHaveBeenCalled();
+      expect(result.finishReason).toBe("stop");
+    });
+
+    // Ollama reports mid-stream failures as an HTTP 200 NDJSON line like {"error": "..."}.
+    // ollama-ai-provider-v2@3 drops that line, so the adapter has to surface it.
+    it("reports an error that Ollama sends mid-stream instead of finishing normally", async () => {
+      const result = await streamOllama([
+        [ollamaChunk("partial ", false)],
+        // Same network chunk as the error line.
+        [
+          ollamaChunk("text ", false),
+          { error: "llama runner process has terminated: out of memory" },
+        ],
+      ]);
+
+      expect(result.text).toBe("partial text ");
+      expect(result.errors).toEqual(["llama runner process has terminated: out of memory"]);
+      expect(result.onError).toHaveBeenCalledTimes(1);
+      expect(result.finishReason).toBe("error");
+    });
   });
 });

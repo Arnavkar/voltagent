@@ -40,7 +40,7 @@
     "fast-glob": "^3.3.3",
     "gray-matter": "^4.0.3",
     "micromatch": "^4.0.8",
-    "ollama-ai-provider-v2": "^1.5.3",
+    "ollama-ai-provider-v2": "^3.0.1",
     "ts-pattern": "^5.7.1",
     "type-fest": "^4.41.0",
     "uuid": "^9.0.1",
