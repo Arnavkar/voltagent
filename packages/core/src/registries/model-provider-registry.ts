@@ -1,10 +1,5 @@
 import { safeStringify } from "@voltagent/internal";
-import {
-  type EmbeddingModel,
-  type LanguageModel,
-  type LanguageModelMiddleware,
-  wrapProvider,
-} from "ai";
+import type { EmbeddingModel, LanguageModel } from "ai";
 import {
   MODEL_PROVIDER_REGISTRY,
   type ModelProviderRegistryEntry,
@@ -740,99 +735,6 @@ const buildSapProvider: ProviderAdapter = (config, moduleExports) => {
   return (createFn?.() ?? providerExport) as ModelProviderEntry;
 };
 
-class OllamaStreamError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "OllamaStreamError";
-  }
-}
-
-const readOllamaStreamError = (line: string): string | undefined => {
-  try {
-    const parsed = JSON.parse(line) as unknown;
-    if (parsed && typeof parsed === "object" && "error" in parsed) {
-      const { error } = parsed as { error: unknown };
-      return typeof error === "string" ? error : safeStringify(error);
-    }
-  } catch {
-    // Not JSON; the provider handles it.
-  }
-  return undefined;
-};
-
-// ollama-ai-provider-v2@3 drops Ollama's mid-stream {"error": "..."} NDJSON line, so fail the body
-// on it here and let ollamaStreamErrorMiddleware turn that into an error part.
-const fetchWithOllamaStreamErrors: typeof fetch = async (input, init) => {
-  const response = await fetch(input, init);
-  if (!response.body || !response.headers.get("content-type")?.includes("ndjson")) {
-    return response;
-  }
-
-  const decoder = new TextDecoder();
-  let buffer = "";
-  const body = response.body.pipeThrough(
-    new TransformStream<Uint8Array, Uint8Array>({
-      transform(chunk, controller) {
-        controller.enqueue(chunk);
-        buffer += decoder.decode(chunk, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
-        for (const line of lines) {
-          const error = readOllamaStreamError(line);
-          if (error !== undefined) {
-            throw new OllamaStreamError(error);
-          }
-        }
-      },
-      flush() {
-        const error = readOllamaStreamError(buffer + decoder.decode());
-        if (error !== undefined) {
-          throw new OllamaStreamError(error);
-        }
-      },
-    }),
-  );
-
-  return new Response(body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: response.headers,
-  });
-};
-
-// A failed stream leaves streamText's finishReason unresolved and skips onError; an error part doesn't.
-const ollamaStreamErrorMiddleware: LanguageModelMiddleware = {
-  specificationVersion: "v3",
-  wrapStream: async ({ doStream }) => {
-    const { stream, ...rest } = await doStream();
-    const reader = stream.getReader();
-    return {
-      ...rest,
-      stream: new ReadableStream({
-        async pull(controller) {
-          try {
-            const { done, value } = await reader.read();
-            if (done) {
-              controller.close();
-            } else {
-              controller.enqueue(value);
-            }
-          } catch (error) {
-            if (!(error instanceof OllamaStreamError)) {
-              throw error;
-            }
-            controller.enqueue({ type: "error", error: error.message });
-            controller.close();
-          }
-        },
-        cancel(reason) {
-          return reader.cancel(reason);
-        },
-      }),
-    };
-  },
-};
-
 const buildOllamaProvider: ProviderAdapter = (config, moduleExports) => {
   const createFn = getModuleFunction(moduleExports, "createOllama");
   const providerExport = resolveProviderExport(moduleExports, "ollama");
@@ -841,15 +743,7 @@ const buildOllamaProvider: ProviderAdapter = (config, moduleExports) => {
     throw new Error(`Missing Ollama provider export in "${config.npm}".`);
   }
 
-  const provider = createFn?.({ fetch: fetchWithOllamaStreamErrors });
-  if (!provider) {
-    return providerExport as ModelProviderEntry;
-  }
-
-  return wrapProvider({
-    provider: provider as Parameters<typeof wrapProvider>[0]["provider"],
-    languageModelMiddleware: ollamaStreamErrorMiddleware,
-  }) as ModelProviderEntry;
+  return (createFn?.() ?? providerExport) as ModelProviderEntry;
 };
 
 const PACKAGE_ADAPTERS: Record<string, ProviderAdapter> = {
