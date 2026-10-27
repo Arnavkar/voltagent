@@ -328,7 +328,6 @@ const vertexExpressNote =
 
 const envNoteByProvider = {
   "google-vertex": vertexExpressNote,
-  "google-vertex-anthropic": vertexExpressNote,
 };
 
 const buildProviderDoc = (providerId, entry, models) => {
